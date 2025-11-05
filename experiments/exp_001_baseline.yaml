@@ -1,0 +1,7 @@
+ablation_studies:
+  - name: "baseline_ocr_text_vec"
+    params:
+      pipeline.name: "ocr-text-vec"
+      ocr.engine: "tesseract"
+      encoder.text.model: "sentence-transformers/all-MiniLM-L6-v2"
+      index.path: "outputs/indexes/tesseract_minilm"

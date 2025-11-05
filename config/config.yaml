@@ -1,0 +1,156 @@
+# Main configuration file for RAG Charts project
+
+project:
+  name: "rag_charts_project"
+  version: "1.0.0"
+  seed: 42
+
+paths:
+  data_dir: "data"
+  raw_data: "data/raw"
+  labels_dir: "data/labels"
+  synthetic_dir: "data/synthetic"
+  models_dir: "models"
+  cache_dir: "cache"
+  output_dir: "outputs"
+  logs_dir: "logs"
+
+# OCR Configuration
+ocr:
+  engines:
+    tesseract:
+      enabled: true
+      lang: "eng"
+      config: "--oem 3 --psm 6"
+    trocr:
+      enabled: true
+      model: "microsoft/trocr-base-printed"
+      device: "mps"
+    donut:
+      enabled: true
+      model: "naver-clova-ix/donut-base"
+      device: "mps"
+
+# Image Processing
+image_processing:
+  target_dpi: 300
+  max_dimension: 2048
+  normalize: true
+  denoise: true
+  detect_figures: true
+
+# Encoding Models
+encoders:
+  image:
+    model: "openai/clip-vit-base-patch32"
+    device: "mps"
+    batch_size: 32
+  text:
+    model: "sentence-transformers/all-MiniLM-L6-v2"
+    device: "mps"
+    batch_size: 64
+  table:
+    model: "google/tapas-base-finetuned-wtq"
+    device: "mps"
+    batch_size: 16
+
+# Derendering / Table Extraction
+derendering:
+  chart_to_table:
+    enabled: true
+    model: "deplot"  # or custom implementation
+  table_extraction:
+    enabled: true
+    models:
+      - "camelot"
+      - "tabula"
+      - "microsoft/table-transformer-detection"
+
+# Vector Store
+vector_store:
+  backend: "faiss"  # or "milvus"
+  faiss:
+    index_type: "HNSW"  # or "IVF"
+    metric: "cosine"
+    nlist: 100
+    m: 32
+    ef_construction: 200
+    ef_search: 50
+  milvus:
+    host: "localhost"
+    port: 19530
+    collection_name: "chart_embeddings"
+
+# RAG Pipelines
+pipelines:
+  image_vec:
+    enabled: true
+    top_k: 5
+    rerank: true
+  ocr_text_vec:
+    enabled: true
+    top_k: 5
+    include_caption: true
+  derender_table_vec:
+    enabled: true
+    top_k: 3
+    use_table_encoder: true
+  e2e_vision_lm:
+    enabled: true
+    model: "microsoft/donut-base"
+
+# LLM Configuration
+llm:
+  provider: "groq"  # or "anthropic", "local"
+  model: "meta-llama/llama-4-scout-17b-16e-instruct"
+  temperature: 0.0
+  max_tokens: 1000
+  timeout: 60
+
+# Evaluation
+evaluation:
+  metrics:
+    - "recall_at_k"
+    - "mrr"
+    - "exact_match"
+    - "f1"
+    - "rouge_l"
+    - "cer"
+    - "wer"
+  k_values: [1, 3, 5, 10]
+  statistical_tests: true
+  confidence_level: 0.95
+
+# Datasets
+datasets:
+  chartqa:
+    enabled: true
+    path: "data/chartqa"
+    split: "test"
+  plotqa:
+    enabled: true
+    path: "data/plotqa"
+    split: "test"
+  pubtabnet:
+    enabled: true
+    path: "data/pubtabnet"
+    split: "test"
+  docvqa:
+    enabled: false
+    path: "data/docvqa"
+    split: "test"
+
+# Experiment Tracking
+tracking:
+  backend: "wandb"  # or "mlflow"
+  project_name: "rag-charts"
+  entity: "your-entity"
+
+# Compute
+compute:
+  num_workers: 4
+  gpu_ids: [0]
+  mixed_precision: true
+  batch_sizes:
+    inference: 32
+    indexing: 64
