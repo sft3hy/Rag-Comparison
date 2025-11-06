@@ -8,6 +8,8 @@ from pathlib import Path
 from loguru import logger
 from abc import ABC, abstractmethod
 
+from src.utils.config import Config
+
 
 class VectorStore(ABC):
     """Abstract base class for vector stores."""
@@ -391,26 +393,27 @@ class MilvusVectorStore(VectorStore):
 class VectorStoreManager:
     """Manager for vector stores."""
 
-    def __init__(self, config: Dict[str, Any]):
-        """Initialize vector store manager.
+    def __init__(self, config: Config):
+        """
+        Initialize vector store manager.
 
         Args:
-            config: Configuration dict
+            config: The main Pydantic Config object.
         """
         self.config = config
-        vs_config = config.get("vector_store", {})
-        backend = vs_config.get("backend", "faiss")
+        # Access the 'vector_store' field as a direct attribute.
+        vs_config = config.vector_store
+        backend = vs_config.backend
 
         self.stores: Dict[str, VectorStore] = {}
 
         if backend == "faiss":
-            faiss_config = vs_config.get("faiss", {})
-            # We'll create stores on-demand with specific dimensions
             self.backend = "faiss"
-            self.faiss_config = faiss_config
+            # vs_config.faiss is a dictionary from the Pydantic model
+            self.faiss_config = vs_config.faiss
         elif backend == "milvus":
             self.backend = "milvus"
-            self.milvus_config = vs_config.get("milvus", {})
+            self.milvus_config = vs_config.milvus
         else:
             raise ValueError(f"Unknown backend: {backend}")
 
@@ -430,11 +433,20 @@ class VectorStoreManager:
             return self.stores[name]
 
         if self.backend == "faiss":
+            # --- FIX STARTS HERE ---
+            # Create a copy of the config to safely modify it.
+            faiss_kwargs = self.faiss_config.copy()
+
+            # Pop the arguments that we are defining explicitly to avoid duplication.
+            index_type = faiss_kwargs.pop("index_type", "HNSW")
+            metric = faiss_kwargs.pop("metric", "cosine")
+
+            # Now, faiss_kwargs only contains the remaining specific params (e.g., m, nlist).
             store = FAISSVectorStore(
                 dimension=dimension,
-                index_type=self.faiss_config.get("index_type", "HNSW"),
-                metric=self.faiss_config.get("metric", "cosine"),
-                **self.faiss_config,
+                index_type=index_type,
+                metric=metric,
+                **faiss_kwargs,  # Unpack the cleaned dictionary
             )
         else:  # milvus
             store = MilvusVectorStore(

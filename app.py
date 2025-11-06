@@ -54,13 +54,13 @@ def get_config():
 
 @st.cache_resource
 def get_encoder_manager(_config: Config):
-    st.write("`[Cache]` Loading Encoder Manager (CLIP, Sentence-Transformers)...")
+    # st.write("`[Cache]` Loading Encoder Manager (CLIP, Sentence-Transformers)...")
     return EncoderManager(_config)
 
 
 @st.cache_resource
 def get_ocr_manager(_config: OCRConfig):  # <-- FIX: Expects the specific OCRConfig
-    st.write("`[Cache]` Loading OCR Manager (Tesseract, TrOCR, Donut)...")
+    # st.write("`[Cache]` Loading OCR Manager (Tesseract, TrOCR, Donut)...")
     return OCRManager(_config)
 
 
@@ -220,7 +220,10 @@ if app_mode == "Live Querying":
                 np.frombuffer(bytes_data, np.uint8), cv2.IMREAD_COLOR
             )
             st.image(
-                cv2_img, channels="BGR", caption="Uploaded Chart", use_column_width=True
+                cv2_img,
+                channels="BGR",
+                caption="Uploaded Chart",
+                width="stretch",
             )
     with col2:
         if uploaded_file:
