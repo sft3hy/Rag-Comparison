@@ -65,28 +65,28 @@ BENCHMARK_SET = {
         # NOTE: You will need to manually create the correct questions and answers for your images.
         # These are illustrative placeholders.
         {
-            "question": "What is the value for the 'East' region?",
-            "answer": "2500",
+            "question": "What is the value for 2004 on the top line?",
+            "answer": "67",
             "relevant_doc_ids": ["34.png"],
         },
         {
-            "question": "Which category had the highest value in the chart?",
-            "answer": "Category C",
+            "question": "What percentage have not heard of latinx?",
+            "answer": "76%",
             "relevant_doc_ids": ["43.png"],
         },
         {
-            "question": "What was the percentage in 2022?",
-            "answer": "45%",
+            "question": "What percentage voted for 'stay about the same'?",
+            "answer": "42%",
             "relevant_doc_ids": ["46.png"],
         },
         {
-            "question": "How many units were sold in Q3?",
-            "answer": "75",
+            "question": "What percent gave no answer?",
+            "answer": "1%",
             "relevant_doc_ids": ["74.png"],
         },
         {
-            "question": "What is the trend for Product A?",
-            "answer": "increasing",
+            "question": "What percent thought the worst is behind us in June?",
+            "answer": "40&",
             "relevant_doc_ids": ["86.png"],
         },
     ],
@@ -292,8 +292,8 @@ elif app_mode == "Benchmark Evaluation":
         st.write("The following images and questions will be used for the evaluation:")
         for img_name, label in zip(BENCHMARK_SET["images"], BENCHMARK_SET["labels"]):
             st.image(str(BENCHMARK_IMAGE_DIR / img_name), width=300, caption=img_name)
-            # st.markdown(f"- **Q:** {label['question']}")
-            # st.markdown(f"- **A:** {label['answer']}")
+            st.markdown(f"- **Q:** {label['question']}")
+            st.markdown(f"- **A:** {label['answer']}")
             st.divider()
 
     engine_to_eval = st.selectbox(
