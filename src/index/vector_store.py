@@ -38,103 +38,73 @@ class VectorStore(ABC):
 
 
 class FAISSVectorStore(VectorStore):
-    """FAISS-based vector store."""
-
     def __init__(
         self, dimension: int, index_type: str = "HNSW", metric: str = "cosine", **kwargs
     ):
-        """Initialize FAISS vector store.
-
-        Args:
-            dimension: Embedding dimension
-            index_type: Type of index ('Flat', 'IVF', 'HNSW')
-            metric: Distance metric ('cosine', 'l2')
-            **kwargs: Additional parameters for specific index types
-        """
         self.dimension = dimension
         self.index_type = index_type
         self.metric = metric
         self.metadata_store = []
         self.id_counter = 0
 
-        # Create index based on type
         if index_type == "Flat":
-            if metric == "cosine":
-                self.index = faiss.IndexFlatIP(dimension)  # Inner product for cosine
-            else:
-                self.index = faiss.IndexFlatL2(dimension)
-
+            self.index = (
+                faiss.IndexFlatIP(dimension)
+                if metric == "cosine"
+                else faiss.IndexFlatL2(dimension)
+            )
         elif index_type == "IVF":
             nlist = kwargs.get("nlist", 100)
             quantizer = faiss.IndexFlatL2(dimension)
-            if metric == "cosine":
-                self.index = faiss.IndexIVFFlat(
-                    quantizer, dimension, nlist, faiss.METRIC_INNER_PRODUCT
-                )
-            else:
-                self.index = faiss.IndexIVFFlat(
-                    quantizer, dimension, nlist, faiss.METRIC_L2
-                )
+            metric_type = (
+                faiss.METRIC_INNER_PRODUCT if metric == "cosine" else faiss.METRIC_L2
+            )
+            self.index = faiss.IndexIVFFlat(quantizer, dimension, nlist, metric_type)
             self.index.nprobe = kwargs.get("nprobe", 10)
-
         elif index_type == "HNSW":
             m = kwargs.get("m", 32)
             self.index = faiss.IndexHNSWFlat(dimension, m)
             self.index.hnsw.efConstruction = kwargs.get("ef_construction", 200)
             self.index.hnsw.efSearch = kwargs.get("ef_search", 50)
-
         else:
             raise ValueError(f"Unknown index type: {index_type}")
-
         logger.info(f"Initialized FAISS {index_type} index with dimension {dimension}")
 
     def _normalize_embeddings(self, embeddings: np.ndarray) -> np.ndarray:
-        """Normalize embeddings for cosine similarity.
-
-        Args:
-            embeddings: Input embeddings
-
-        Returns:
-            Normalized embeddings
-        """
         if self.metric == "cosine":
-            norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-            norms[norms == 0] = 1  # Avoid division by zero
-            return embeddings / norms
+            faiss.normalize_L2(embeddings)
         return embeddings
 
     def add(
         self, embeddings: np.ndarray, metadata: Optional[List[Dict[str, Any]]] = None
     ) -> List[str]:
-        """Add embeddings to index.
-
-        Args:
-            embeddings: Array of embeddings (n_samples, dimension)
-            metadata: List of metadata dicts for each embedding
-
-        Returns:
-            List of assigned IDs
         """
+        Add embeddings to the index, robustly handling 1D or empty inputs.
+        """
+        # --- FIX STARTS HERE: Handle empty and 1D arrays ---
+        if embeddings.size == 0:
+            logger.warning("Attempted to add an empty list of embeddings. Skipping.")
+            return []
+
+        # Ensure embeddings are 2D for batch processing
+        if embeddings.ndim == 1:
+            logger.debug("Received a 1D embedding array. Reshaping to (1, D).")
+            embeddings = embeddings.reshape(1, -1)
+        # --- FIX ENDS HERE ---
+
         if embeddings.shape[1] != self.dimension:
             raise ValueError(
                 f"Embedding dimension {embeddings.shape[1]} != index dimension {self.dimension}"
             )
 
-        # Normalize if using cosine
-        embeddings = self._normalize_embeddings(embeddings)
-
-        # Train index if needed (for IVF)
+        embeddings_np = embeddings.astype("float32")
+        self._normalize_embeddings(embeddings_np)
         if self.index_type == "IVF" and not self.index.is_trained:
-            logger.info("Training IVF index...")
-            self.index.train(embeddings)
+            self.index.train(embeddings_np)
+        self.index.add(embeddings_np)
 
-        # Add to index
-        n_samples = embeddings.shape[0]
-        self.index.add(embeddings.astype("float32"))
-
-        # Store metadata
         if metadata is None:
-            metadata = [{}] * n_samples
+            metadata = [{}] * embeddings.shape[0]
 
         ids = []
         for i, meta in enumerate(metadata):
@@ -142,99 +112,42 @@ class FAISSVectorStore(VectorStore):
             meta["_id"] = doc_id
             self.metadata_store.append(meta)
             ids.append(doc_id)
-
-        self.id_counter += n_samples
+        self.id_counter += len(metadata)
         logger.info(
-            f"Added {n_samples} embeddings to index (total: {self.index.ntotal})"
+            f"Added {len(metadata)} embeddings to index (total: {self.index.ntotal})"
         )
-
         return ids
 
     def search(
         self, query_embedding: np.ndarray, k: int = 5
     ) -> Tuple[np.ndarray, np.ndarray, List[Dict[str, Any]]]:
-        """Search for k nearest neighbors.
-
-        Args:
-            query_embedding: Query embedding (1D or 2D array)
-            k: Number of results to return
-
-        Returns:
-            Tuple of (distances, indices, metadata_list)
-        """
-        # Ensure 2D
-        if query_embedding.ndim == 1:
-            query_embedding = query_embedding.reshape(1, -1)
-
-        # Normalize if using cosine
-        query_embedding = self._normalize_embeddings(query_embedding)
-
-        # Search
-        k = min(k, self.index.ntotal)  # Can't return more than we have
-        distances, indices = self.index.search(query_embedding.astype("float32"), k)
-
-        # Get metadata for results
-        metadata_list = []
-        for idx in indices[0]:
-            if idx < len(self.metadata_store):
-                metadata_list.append(self.metadata_store[idx])
-            else:
-                metadata_list.append({})
-
+        query_embedding = query_embedding.reshape(1, -1).astype("float32")
+        self._normalize_embeddings(query_embedding)
+        k = min(k, self.index.ntotal)
+        if k == 0:
+            return np.array([]), np.array([]), []
+        distances, indices = self.index.search(query_embedding, k)
+        metadata_list = [
+            self.metadata_store[i] for i in indices[0] if i < len(self.metadata_store)
+        ]
         return distances[0], indices[0], metadata_list
 
     def save(self, path: str):
-        """Save index and metadata to disk.
+        p = Path(path)
+        p.mkdir(parents=True, exist_ok=True)
+        faiss.write_index(self.index, str(p / "index.faiss"))
+        with open(p / "metadata.pkl", "wb") as f:
+            pickle.dump(self, f)
+        logger.info(f"Saved index to {p}")
 
-        Args:
-            path: Directory path to save to
-        """
-        path = Path(path)
-        path.mkdir(parents=True, exist_ok=True)
-
-        # Save FAISS index
-        index_path = path / "index.faiss"
-        faiss.write_index(self.index, str(index_path))
-
-        # Save metadata
-        metadata_path = path / "metadata.pkl"
-        with open(metadata_path, "wb") as f:
-            pickle.dump(
-                {
-                    "metadata_store": self.metadata_store,
-                    "id_counter": self.id_counter,
-                    "dimension": self.dimension,
-                    "index_type": self.index_type,
-                    "metric": self.metric,
-                },
-                f,
-            )
-
-        logger.info(f"Saved index to {path}")
-
-    def load(self, path: str):
-        """Load index and metadata from disk.
-
-        Args:
-            path: Directory path to load from
-        """
-        path = Path(path)
-
-        # Load FAISS index
-        index_path = path / "index.faiss"
-        self.index = faiss.read_index(str(index_path))
-
-        # Load metadata
-        metadata_path = path / "metadata.pkl"
-        with open(metadata_path, "rb") as f:
-            data = pickle.load(f)
-            self.metadata_store = data["metadata_store"]
-            self.id_counter = data["id_counter"]
-            self.dimension = data["dimension"]
-            self.index_type = data["index_type"]
-            self.metric = data["metric"]
-
-        logger.info(f"Loaded index from {path} ({self.index.ntotal} vectors)")
+    @staticmethod
+    def load(path: str):
+        p = Path(path)
+        with open(p / "metadata.pkl", "rb") as f:
+            store = pickle.load(f)
+        store.index = faiss.read_index(str(p / "index.faiss"))
+        logger.info(f"Loaded index from {p} ({store.index.ntotal} vectors)")
+        return store
 
 
 class MilvusVectorStore(VectorStore):

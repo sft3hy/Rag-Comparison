@@ -10,6 +10,9 @@ from pathlib import Path
 import json
 from tqdm import tqdm
 from loguru import logger
+from pdf2image import convert_from_path
+import numpy as np
+import cv2
 
 from src.utils.config import load_config
 from src.utils.logger import setup_logger
@@ -66,63 +69,74 @@ def main(input_dir: Path, output_dir: Path):
 
     metadata_path = output_dir / "ingestion_metadata.jsonl"
     logger.info(f"Recursively searching for images in {input_dir}...")
-    image_paths = (
+    file_paths = (
         list(input_dir.glob("**/*.[pP][nN][gG]"))
         + list(input_dir.glob("**/*.[jJ][pP][gG]"))
         + list(input_dir.glob("**/*.[jJ][pP][eE][gG]"))
+        + list(input_dir.glob("**/*.[pP][dD][fF]"))
     )
-    logger.info(f"Found {len(image_paths)} images to process.")
+    logger.info(f"Found {len(file_paths)} images to process.")
 
     with open(metadata_path, "w") as f_meta:
-        for image_path in tqdm(image_paths, desc="Processing images"):
+        for file_path in tqdm(file_paths, desc="Processing files"):
             try:
-                # 1. Preprocess image
-                processed_image = preprocessor.process_file(
-                    str(image_path), str(processed_dir / image_path.name)
-                )
+                # --- UPDATED SECTION: Handle PDF and Image files differently ---
+                images_to_process = []
+                if file_path.suffix.lower() == ".pdf":
+                    logger.debug(f"Converting PDF: {file_path.name}")
+                    # Convert PDF pages to a list of PIL Images
+                    pil_images = convert_from_path(
+                        file_path, dpi=config.image_processing.get("target_dpi", 300)
+                    )
+                    for i, pil_image in enumerate(pil_images):
+                        # Convert PIL image to numpy array for processing
+                        image_np = np.array(pil_image)
+                        # Create a unique name for the page
+                        page_base_name = f"{file_path.stem}_page_{i+1}"
+                        images_to_process.append((image_np, page_base_name, i + 1))
+                else:
+                    # For regular images, process as before
+                    image_np = preprocessor.load_image(str(file_path))
+                    images_to_process.append((image_np, file_path.stem, None))
 
-                # 2. Detect figures (conditionally based on config)
-                if img_proc_config.get("detect_figures", True):
+                for image, base_name, page_num in images_to_process:
+                    # 1. Preprocess image
+                    processed_image = preprocessor.preprocess(image)
+
+                    # Save the processed full page/image for reference
+                    processed_img_path = processed_dir / f"{base_name}.png"
+                    cv2.imwrite(
+                        str(processed_img_path),
+                        cv2.cvtColor(processed_image, cv2.COLOR_RGB2BGR),
+                    )
+
+                    # 2. Detect figures
                     figures = detector.detect_figures(processed_image)
                     if not figures:
-                        logger.warning(f"No figures detected in {image_path.name}")
+                        logger.warning(f"No figures detected in {base_name}")
                         continue
 
-                    # 3. Save figures and metadata
-                    base_name = image_path.stem
+                    # 3. Save figures
                     saved_paths = detector.save_figures(
                         processed_image, figures, str(figures_dir), base_name
                     )
 
-                    # 4. Write metadata to file
+                    # 4. Write metadata for each figure
                     for i, fig in enumerate(figures):
                         metadata = {
-                            "source_image": image_path.name,
+                            "source_file": file_path.name,
+                            "source_page": page_num,
                             "figure_path": Path(saved_paths[i]).name,
                             "bbox": fig["bbox"],
                             "area": fig["area"],
                         }
                         f_meta.write(json.dumps(metadata) + "\n")
-                else:
-                    logger.info("Skipping figure detection as per config.")
-                    # If not detecting figures, the whole image is the "figure"
-                    metadata = {
-                        "source_image": image_path.name,
-                        "figure_path": image_path.name,  # The processed image is the figure
-                        "bbox": [
-                            0,
-                            0,
-                            processed_image.shape[1],
-                            processed_image.shape[0],
-                        ],
-                        "area": processed_image.shape[0] * processed_image.shape[1],
-                    }
-                    f_meta.write(json.dumps(metadata) + "\n")
+                # --- END UPDATED SECTION ---
 
             except Exception as e:
-                logger.error(f"Failed to process {image_path.name}: {e}")
+                logger.error(f"Failed to process {file_path.name}: {e}")
 
-    logger.info(f"Ingestion complete. Processed data saved to: {output_dir}")
+    logger.info(f"Ingestion complete. Figures saved to: {figures_dir}")
     logger.info(f"Metadata saved to: {metadata_path}")
 
 

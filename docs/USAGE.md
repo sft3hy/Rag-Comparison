@@ -30,9 +30,9 @@ This script runs an OCR engine on the extracted figures to convert the visual te
 **Usage:**
 ```bash
 python run_ocr.py \
-    --input-dir path/to/the/extracted/figures \
-    --output-file path/to/save/ocr_results.jsonl \
-    --engine [tesseract|trocr|donut]
+    --input-dir data/processed/figures \
+    --output-file data/ocr_results/ocr_results.jsonl \
+    --engine tesseract
 ```
 *   `--input-dir`: The `figures` directory created in the previous step.
 *   `--output-file`: The output `.jsonl` file where each line contains the OCR text for one figure.
@@ -52,8 +52,8 @@ This script takes the extracted information (text, images, or tables) and builds
 ```bash
 python index_build.py \
     --index-type [text|image|table] \
-    --input-path /path/to/source/data \
-    --output-dir /path/to/save/index
+    --input-path data/processed/ingestion_metadata.jsonl \
+    --output-dir data/FAISS_index
 ```
 *   `--index-type`: The modality to index. `text` uses the OCR output, `image` uses the figure images directly.
 *   `--input-path`: Path to the source data (e.g., the `.jsonl` from OCR).

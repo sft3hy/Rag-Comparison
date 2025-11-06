@@ -80,6 +80,7 @@ outputs/
 temp_index/
 *.csv
 *.json
+*.jsonl
 !config/*.json
 !experiments/*.json
 

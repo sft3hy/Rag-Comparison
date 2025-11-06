@@ -7,8 +7,8 @@ from typing import Dict, List, Tuple, Optional
 from abc import ABC, abstractmethod
 from loguru import logger
 import torch
-from transformers import TrOCRProcessor, VisionEncoderDecoderModel
 from src.utils.config import OCRConfig
+from transformers import TrOCRProcessor, VisionEncoderDecoderModel, DonutProcessor
 
 
 class OCREngine(ABC):
@@ -156,31 +156,24 @@ class TrOCREngine(OCREngine):
 
 
 class DonutOCREngine(OCREngine):
-    """Donut OCR engine (OCR-free document understanding)."""
-
     def __init__(
-        self,
-        model_name: str = "naver-clova-ix/donut-base",
-        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        self, model_name: str = "naver-clova-ix/donut-base", device: str = "cuda"
     ):
-        """Initialize Donut OCR.
-
-        Args:
-            model_name: HuggingFace model name
-            device: Device to run model on
-        """
         self.model_name = model_name
-        self.device = device
-
+        device_preference = device
+        if device_preference == "cuda" and not torch.cuda.is_available():
+            logger.warning("CUDA not available. Falling back to MPS or CPU.")
+            self.device = "mps" if torch.backends.mps.is_available() else "cpu"
+        else:
+            self.device = device_preference
         try:
-            from transformers import DonutProcessor, VisionEncoderDecoderModel
-
-            logger.info(f"Loading Donut model: {model_name}")
+            logger.info(f"Loading Donut model: {model_name} onto device: {self.device}")
             self.processor = DonutProcessor.from_pretrained(model_name)
-            self.model = VisionEncoderDecoderModel.from_pretrained(model_name)
-            self.model.to(device)
+            self.model = VisionEncoderDecoderModel.from_pretrained(model_name).to(
+                self.device
+            )
             self.model.eval()
-            logger.info(f"Donut loaded on {device}")
+            logger.info(f"Donut loaded on {self.device}")
         except ImportError:
             logger.warning(
                 "Donut model not available, install with: pip install donut-python"
@@ -189,16 +182,7 @@ class DonutOCREngine(OCREngine):
             self.model = None
 
     def extract_text(self, image: np.ndarray) -> Dict[str, any]:
-        """Extract text using Donut.
-
-        Args:
-            image: Input image
-
-        Returns:
-            OCR results dict
-        """
-        if self.model is None:
-            logger.warning("Donut model not loaded, returning empty result")
+        if self.model is None or self.processor is None:
             return {
                 "text": "",
                 "tokens": [],
@@ -207,33 +191,65 @@ class DonutOCREngine(OCREngine):
                 "engine": "donut",
             }
 
-        # Convert to PIL
-        pil_image = Image.fromarray(image)
-
-        # Process
+        pil_image = Image.fromarray(image).convert("RGB")
         pixel_values = self.processor(pil_image, return_tensors="pt").pixel_values.to(
             self.device
         )
 
-        # Generate
-        with torch.no_grad():
-            decoder_input_ids = torch.tensor(
-                [[self.model.config.decoder_start_token_id]]
-            ).to(self.device)
+        # --- FIX STARTS HERE: Definitive fallback for special tokens ---
+        task_prompt = "<s_doc-parser>"
+        decoder_input_ids = self.processor.tokenizer(
+            task_prompt, add_special_tokens=False, return_tensors="pt"
+        ).input_ids.to(self.device)
 
+        # Get special token IDs from the tokenizer, which is the most reliable source.
+        pad_token_id = self.processor.tokenizer.pad_token_id
+        eos_token_id = self.processor.tokenizer.eos_token_id
+        unk_token_id = self.processor.tokenizer.unk_token_id  # Fallback token
+
+        # If pad token is missing, try to use eos token.
+        if pad_token_id is None:
+            pad_token_id = eos_token_id
+
+        # If both pad and eos tokens are missing, use the unk token as a last resort.
+        # This prevents the NoneType error.
+        if pad_token_id is None and eos_token_id is None:
+            if unk_token_id is not None:
+                logger.warning(
+                    "PAD and EOS tokens not found, falling back to UNK token."
+                )
+                pad_token_id = unk_token_id
+                eos_token_id = unk_token_id
+            else:
+                # This case is extremely unlikely but handles a completely broken tokenizer.
+                logger.error(
+                    "Critical error: No PAD, EOS, or UNK tokens found in tokenizer."
+                )
+                return {
+                    "text": "Error: Tokenizer is misconfigured",
+                    "tokens": [],
+                    "bboxes": [],
+                    "confidences": [],
+                    "engine": "donut",
+                }
+
+        # Generate text
+        with torch.no_grad():
             outputs = self.model.generate(
                 pixel_values,
                 decoder_input_ids=decoder_input_ids,
                 max_length=self.model.decoder.config.max_position_embeddings,
                 early_stopping=True,
-                pad_token_id=self.processor.tokenizer.pad_token_id,
-                eos_token_id=self.processor.tokenizer.eos_token_id,
+                pad_token_id=pad_token_id,
+                eos_token_id=eos_token_id,
             )
+        # --- FIX ENDS HERE ---
 
-        # Decode
         sequence = self.processor.batch_decode(outputs)[0]
-        sequence = sequence.replace(self.processor.tokenizer.eos_token, "")
-        sequence = sequence.replace(self.processor.tokenizer.pad_token, "")
+        sequence = sequence.replace(
+            self.processor.tokenizer.eos_token or "", ""
+        ).replace(self.processor.tokenizer.pad_token or "", "")
+        sequence = sequence.replace(task_prompt, "").strip()
 
         return {
             "text": sequence,
