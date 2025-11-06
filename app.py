@@ -15,7 +15,8 @@ import numpy as np
 import json
 import tempfile
 import time
-from typing import List, Dict
+from typing import List, Dict, Tuple
+import os
 
 # --- Core Codebase Imports ---
 import sys
@@ -26,10 +27,13 @@ from src.utils.config import load_config, Config, OCRConfig
 from src.utils.logger import setup_logger
 from src.ocr.engines import OCRManager
 from src.encoders.embedders.embedder import EncoderManager
-from src.index.vector_store import VectorStoreManager
+from src.index.vector_store import VectorStoreManager, FAISSVectorStore
 from src.rag_pipelines.orchestrator import PipelineOrchestrator, OCRTextVecPipeline
 from src.eval.metrics import MetricsCalculator
 from pdf2image import convert_from_path
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 
 # --- App Configuration & Initialization ---
 st.set_page_config(
@@ -98,19 +102,19 @@ BENCHMARK_SET = {
 def run_ocr_process(
     ocr_manager: OCRManager, engine: str, image_paths: List[Path], output_file: Path
 ):
-    """Runs OCR on a specific list of real image files."""
     with open(output_file, "w") as f_out:
+        all_ocr_results = {}
         for image_path in image_paths:
             if not image_path.exists():
-                st.warning(f"Benchmark image not found: {image_path}. Skipping.")
                 continue
             image = cv2.cvtColor(cv2.imread(str(image_path)), cv2.COLOR_BGR2RGB)
             result = ocr_manager.run_ocr(image, engine_name=engine)
             result["image_path"] = image_path.name
             f_out.write(json.dumps(result) + "\n")
+            all_ocr_results[image_path.name] = result["text"]
+        return all_ocr_results
 
 
-# ... (run_indexing_process and run_evaluation_process remain the same) ...
 def run_indexing_process(
     encoder_manager: EncoderManager, input_path: Path, output_dir: Path
 ):
@@ -126,39 +130,81 @@ def run_indexing_process(
         if data.get("text"):
             texts.append(data["text"])
             metadatas.append({"chunk_id": data["image_path"], "text": data["text"]})
+    if not texts:
+        return False  # Indicate failure if no text was indexed
     embeddings = embedder.embed(texts)
     store.add(embeddings, metadatas)
     store.save(str(output_dir))
+    return True
 
 
+# --- ENHANCED EVALUATION PROCESS WITH DEBUG OUTPUT & FIX ---
 def run_evaluation_process(
     encoder_manager: EncoderManager, index_dir: Path, labels: List[Dict]
-) -> dict:
+) -> Tuple[Dict, List[Dict]]:
     config = get_config()
-    vs_manager = VectorStoreManager(config)
     orchestrator = PipelineOrchestrator(config)
     metrics_calculator = MetricsCalculator()
-    dimension = encoder_manager.text_embedder.model.get_sentence_embedding_dimension()
-    store = vs_manager.get_store(name=f"eval_store_{time.time()}", dimension=dimension)
-    store.load(str(index_dir))
+
+    # --- FIX: Directly load the store and capture the returned object ---
+    try:
+        # The load method is a staticmethod that returns a new, populated store instance.
+        store = FAISSVectorStore.load(str(index_dir))
+        if store.index.ntotal == 0:
+            st.error(
+                "Evaluation Error: The vector index is empty. OCR may have failed."
+            )
+            return {}, []
+    except Exception as e:
+        st.error(f"Failed to load the vector index from path: {index_dir}. Error: {e}")
+        return {}, []
+    # --- END FIX ---
+
     pipeline = OCRTextVecPipeline(config, encoder_manager.text_embedder, store, {})
     orchestrator.register_pipeline("ocr-text-vec", pipeline)
-    results = []
-    for item in labels:  # Use the labels list directly
-        result = orchestrator.run_pipeline("ocr-text-vec", item["question"], k=1)
-        qa_metrics = metrics_calculator.calculate_qa_metrics(
-            result.get("answer", ""), item["answer"]
-        )
-        retrieved_ids = [
-            doc["metadata"].get("chunk_id", "")
-            for doc in result.get("retrieved_docs", [])
-        ]
-        retrieval_metrics = metrics_calculator.calculate_retrieval_metrics(
-            item["relevant_doc_ids"], retrieved_ids
-        )
-        results.append({**qa_metrics, **retrieval_metrics})
-    df_results = pd.DataFrame(results)
-    return df_results.mean(numeric_only=True).to_dict()
+    all_results, debug_steps = [], []
+
+    for item in labels:
+        with st.container():
+            st.markdown(f"--- \n#### ❓ Evaluating Question: `{item['question']}`")
+            st.markdown(
+                f"> **Expected Answer:** `{item['answer']}` | **Correct Document:** `{item['relevant_doc_ids'][0]}`"
+            )
+            rag_result = orchestrator.run_pipeline(
+                "ocr-text-vec", item["question"], k=1
+            )
+            retrieved_docs = rag_result.get("retrieved_docs", [])
+            retrieved_id, retrieval_status = ("None", "❌ **Failed**")
+            if retrieved_docs:
+                retrieved_id = retrieved_docs[0]["metadata"].get(
+                    "chunk_id", "Unknown ID"
+                )
+                if retrieved_id in item["relevant_doc_ids"]:
+                    retrieval_status = "✅ **Correct**"
+            st.markdown(
+                f"**1. Retrieval:** The system retrieved `{retrieved_id}`. Status: {retrieval_status}"
+            )
+            with st.expander("Show Context Sent to LLM"):
+                st.text(rag_result.get("context_text", "No context sent."))
+            predicted_answer = rag_result.get("answer", "")
+            st.markdown("**2. Generation:** LLM generated:")
+            st.info(predicted_answer)
+            qa_metrics = metrics_calculator.calculate_qa_metrics(
+                predicted_answer, item["answer"]
+            )
+            retrieved_ids = [
+                doc["metadata"].get("chunk_id", "") for doc in retrieved_docs
+            ]
+            retrieval_metrics = metrics_calculator.calculate_retrieval_metrics(
+                item["relevant_doc_ids"], retrieved_ids
+            )
+            final_metrics = {**qa_metrics, **retrieval_metrics}
+            st.markdown("**3. Metrics:**")
+            st.json(final_metrics)
+            all_results.append(final_metrics)
+
+    df_results = pd.DataFrame(all_results)
+    return df_results.mean(numeric_only=True).to_dict(), debug_steps
 
 
 # --- Main Application UI ---
@@ -280,21 +326,21 @@ if app_mode == "Live Querying":
         else:
             st.info("Please upload a document to begin.")
 
-# --- BENCHMARK EVALUATION MODE (UPDATED) ---
+# --- BENCHMARK EVALUATION MODE (UPDATED with DEBUG UI) ---
 elif app_mode == "Benchmark Evaluation":
     st.header("🔬 Benchmark Evaluation")
     st.info(
-        "This mode runs a benchmark on a predefined set of real images from `data/processed/processed/` to compare OCR engines."
+        "This mode runs a benchmark on real images from `data/processed/processed/` to compare OCR engines."
     )
-
-    # Display the benchmark set
-    with st.expander("Show Benchmark Images and Questions"):
-        st.write("The following images and questions will be used for the evaluation:")
-        for img_name, label in zip(BENCHMARK_SET["images"], BENCHMARK_SET["labels"]):
-            st.image(str(BENCHMARK_IMAGE_DIR / img_name), width=300, caption=img_name)
-            st.markdown(f"- **Q:** {label['question']}")
-            st.markdown(f"- **A:** {label['answer']}")
-            st.divider()
+    with st.expander("Show Benchmark Set"):
+        st.write("The following images and questions will be used:")
+        count = 0
+        for i in BENCHMARK_SET["images"]:
+            question = BENCHMARK_SET["labels"][count]["question"]
+            answer = BENCHMARK_SET["labels"][count]["answer"]
+            formatted = f"Q/A: {question} {answer}"
+            st.image(str(BENCHMARK_IMAGE_DIR / i), width=200, caption=formatted)
+            count += 1
 
     engine_to_eval = st.selectbox(
         "Choose an OCR engine to benchmark:", ("tesseract", "trocr", "donut")
@@ -304,51 +350,62 @@ elif app_mode == "Benchmark Evaluation":
         image_paths_to_process = [
             BENCHMARK_IMAGE_DIR / fname for fname in BENCHMARK_SET["images"]
         ]
-
-        # Check if benchmark directory exists
         if not BENCHMARK_IMAGE_DIR.exists() or not any(
             p.exists() for p in image_paths_to_process
         ):
             st.error(
-                f"Benchmark image directory not found or is empty: `{BENCHMARK_IMAGE_DIR}`. Please run `run_ingest.py` first."
+                f"Benchmark image directory not found: `{BENCHMARK_IMAGE_DIR}`. Please run `run_ingest.py` first."
             )
         else:
             with tempfile.TemporaryDirectory() as temp_dir:
                 temp_path = Path(temp_dir)
-                with st.status(
-                    f"Running benchmark for **{engine_to_eval}**...", expanded=True
-                ) as status:
-                    st.write(
-                        f"Step 1: Running **{engine_to_eval}** OCR on {len(image_paths_to_process)} real images..."
-                    )
-                    ocr_output_file = temp_path / "ocr_results.jsonl"
-                    run_ocr_process(
+
+                st.subheader(f"Detailed Log for `{engine_to_eval}` Benchmark")
+                # --- Step 1: OCR ---
+                st.markdown("--- \n### Step 1: OCR Extraction")
+                ocr_output_file = temp_path / "ocr_results.jsonl"
+                with st.spinner(
+                    f"Running **{engine_to_eval}** OCR on {len(image_paths_to_process)} images..."
+                ):
+                    ocr_texts = run_ocr_process(
                         ocr_manager,
                         engine_to_eval,
                         image_paths_to_process,
                         ocr_output_file,
                     )
+                st.success("OCR step complete.")
+                with st.expander("Show Extracted OCR Text for Each Image"):
+                    st.json(ocr_texts)
 
-                    st.write("Step 2: Building vector index from OCR results...")
-                    index_dir = temp_path / "index"
-                    index_dir.mkdir()
-                    run_indexing_process(encoder_manager, ocr_output_file, index_dir)
+                # --- Step 2: Indexing ---
+                st.markdown("--- \n### Step 2: Indexing")
+                index_dir = temp_path / "index"
+                index_dir.mkdir()
+                with st.spinner("Building vector index from OCR results..."):
+                    success = run_indexing_process(
+                        encoder_manager, ocr_output_file, index_dir
+                    )
+                if success:
+                    st.success("Indexing complete.")
+                else:
+                    st.error("Indexing failed: No text was extracted from any image.")
+                    st.stop()  # Stop the execution if indexing failed
 
-                    st.write("Step 3: Running evaluation against ground truth...")
-                    summary_metrics = run_evaluation_process(
+                # --- Step 3: Evaluation ---
+                st.markdown("--- \n### Step 3: Evaluation per Question")
+                with st.spinner("Running evaluation against ground truth..."):
+                    summary_metrics, debug_info = run_evaluation_process(
                         encoder_manager, index_dir, BENCHMARK_SET["labels"]
                     )
-
-                    st.session_state[f"results_{engine_to_eval}"] = summary_metrics
-                    status.update(
-                        label=f"Benchmark for **{engine_to_eval}** complete!",
-                        state="complete",
-                        expanded=False,
-                    )
+                st.success("Evaluation step complete.")
+                st.session_state[f"results_{engine_to_eval}"] = summary_metrics
+                st.session_state[f"debug_{engine_to_eval}"] = debug_info
 
     st.divider()
-    st.subheader("📊 Evaluation Results")
-    st.markdown("Results from benchmark runs in this session will appear here.")
+    st.subheader("📊 Final Evaluation Results")
+    st.markdown(
+        "Aggregated results from benchmark runs in this session will appear here."
+    )
     results_data = []
     for engine in ("tesseract", "trocr", "donut"):
         if f"results_{engine}" in st.session_state:
